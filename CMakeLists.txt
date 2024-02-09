@@ -1,0 +1,23 @@
+cmake_minimum_required(VERSION 3.10)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
+set(CMAKE_C_STANDARD 17)
+
+set(CMAKE_DEBUG_POSTFIX d)
+
+set(TARGET_NAME "surv")
+set(BUILD_DIR ${CMAKE_CURRENT_SOURCE_DIR}/build)
+set(EXTERNAL_LIBS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external)
+
+project(${TARGET_NAME} VERSION 0.1.0)
+
+
+# Include directory
+set(INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/include)
+
+file(GLOB_RECURSE SOURCE_FILES "src/*.c")
+list(APPEND SOURCE_FILES ${EXTERNAL_LIBS_DIR}/log.c/src/log.c)
+list(APPEND INCLUDE_DIRECTORIES ${EXTERNAL_LIBS_DIR}/log.c/src)
+add_executable(${TARGET_NAME} ${SOURCE_FILES})
+
+target_include_directories(${TARGET_NAME} PUBLIC ${INCLUDE_DIRECTORIES})
+add_definitions(-DLOG_USE_COLOR)

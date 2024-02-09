@@ -1,0 +1,3 @@
+[submodule "external/log.c"]
+	path = external/log.c
+	url = https://github.com/carterww/log.c.git
