@@ -10,13 +10,19 @@ set(EXTERNAL_LIBS_DIR ${CMAKE_CURRENT_SOURCE_DIR}/external)
 
 project(${TARGET_NAME} VERSION 0.1.0)
 
-
 # Include directory
 set(INCLUDE_DIRECTORIES ${CMAKE_CURRENT_SOURCE_DIR}/include)
 
 file(GLOB_RECURSE SOURCE_FILES "src/*.c")
+
+# Log library
 list(APPEND SOURCE_FILES ${EXTERNAL_LIBS_DIR}/log.c/src/log.c)
 list(APPEND INCLUDE_DIRECTORIES ${EXTERNAL_LIBS_DIR}/log.c/src)
+
+# Hashmap library
+list(APPEND SOURCE_FILES ${EXTERNAL_LIBS_DIR}/hashmap.c/hashmap.c)
+list(APPEND INCLUDE_DIRECTORIES ${EXTERNAL_LIBS_DIR}/hashmap.c)
+
 add_executable(${TARGET_NAME} ${SOURCE_FILES})
 
 target_include_directories(${TARGET_NAME} PUBLIC ${INCLUDE_DIRECTORIES})

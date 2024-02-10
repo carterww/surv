@@ -1,3 +1,8 @@
 [submodule "external/log.c"]
 	path = external/log.c
 	url = https://github.com/carterww/log.c.git
+  ignore = dirty
+[submodule "external/hashmap.c"]
+	path = external/hashmap.c
+	url = https://github.com/carterww/hashmap.c
+  ignore = dirty

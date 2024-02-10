@@ -1,14 +1,13 @@
 #ifndef SURV6_H
 #define SURV6_H
 
-#include <netinet/in.h>
-#include <sys/socket.h>
-#include <stdint.h>
-
 #ifdef __cplusplus
 extern "C" {
 #endif
 
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <stdint.h>
 
 struct surv_server_in6 {
   struct in6_addr address;

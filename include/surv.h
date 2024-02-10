@@ -1,12 +1,14 @@
 #ifndef SURV_H
 #define SURV_H
 
-#include <netinet/in.h>
-#include <sys/socket.h>
-
 #ifdef __cplusplus
 extern "C" {
 #endif
+
+#include <netinet/in.h>
+#include <sys/socket.h>
+
+#include "hashmap.h"
 
 // Callback function type for HTTP methods. These should be registered
 // with the surv_register_* functions.
@@ -15,6 +17,11 @@ typedef struct surv_http_response* (*surv_http_handler)(void *context);
 struct surv_sock_client {
   int client_sockfd;
   struct sockaddr addr;
+};
+
+struct surv_kv {
+  char *key;
+  char *value;
 };
 
 // Context for HTTP requests. This will be passed to the handler
@@ -29,8 +36,8 @@ struct surv_http_context {
     PATCH,
   } method;
   char *path;
-  char *headers;
-  char *query;
+  struct hashmap* headers;
+  struct hashmap* query_params;
   char *body;
   size_t body_len;
 };

@@ -4,25 +4,18 @@
 #include <netinet/in.h>
 #include <pthread.h>
 #include <stdlib.h>
-#include <string.h>
 #include <sys/socket.h>
 #include <unistd.h>
 
+#include "parsers.h"
 #include "log.h"
-
-#define MIN(a, b) (((a) < (b)) ? (a) : (b))
+#include "hashmap.h"
 
 #define REQUEST_BUFFER_SIZE 8192
 
 struct callback_info {
   char *path;
   surv_http_handler cb;
-};
-
-struct parse_state {
-  enum { METHOD, PATH, VERSION, HEADER, BODY, DONE } state;
-  char *buff;
-  size_t buff_size;
 };
 
 // Temporary data structures. I will replace these with a hash table later.
@@ -34,161 +27,6 @@ static struct callback_info patch_cbs[10];
 
 // Server socket file descriptor
 static int sockfd = -1;
-
-static int method_str_to_enum(const char *method, size_t len) {
-  // These should be in a hash table do later
-  if (strncmp(method, "GET", len) == 0) {
-    return GET;
-  } else if (strncmp(method, "POST", len) == 0) {
-    return POST;
-  } else if (strncmp(method, "PUT", len) == 0) {
-    return PUT;
-  } else if (strncmp(method, "DELETE", len) == 0) {
-    return DELETE;
-  } else if (strncmp(method, "PATCH", len) == 0) {
-    return PATCH;
-  }
-  return -1;
-}
-
-static int get_method(const char *buff, size_t buff_size,
-                      struct surv_http_context *ctx, int *read_bytes) {
-  // 8 is lowest len of method
-  int upper_bound = MIN(buff_size, 8);
-  while (*read_bytes < upper_bound) {
-    if (buff[*read_bytes] != ' ') {
-      ++(*read_bytes);
-      continue;
-    }
-    int method = method_str_to_enum(buff, *read_bytes);
-    if (method < 0) {
-      log_error("Invalid method: %s", *read_bytes, buff);
-      return -1;
-    }
-    ctx->method = method;
-    ++(*read_bytes);
-    return 0;
-  }
-  return -1;
-}
-
-static int get_path(const char *buff, size_t buff_size,
-                    struct surv_http_context *ctx, int *read_bytes) {
-  int first_byte = *read_bytes;
-  int should_continue = 1;
-  while (*read_bytes < buff_size) {
-    if (buff[*read_bytes] != ' ') {
-      ++(*read_bytes);
-      continue;
-    } else {
-      should_continue = 0;
-      break;
-    }
-  }
-  size_t len = *read_bytes - first_byte;
-  if (ctx->path == NULL) {
-    ctx->path = calloc(len + 1, sizeof(char));
-    if (ctx->path == NULL) {
-      log_error("calloc() failed: %s", strerror(errno));
-      return -1;
-    }
-  } else {
-    size_t old_len = strlen(ctx->path);
-    len += old_len;
-    ctx->path = realloc(ctx->path, len + 1);
-    if (ctx->path == NULL) {
-      log_error("realloc() failed: %s", strerror(errno));
-      return -1;
-    }
-    ctx->path[old_len + 1] = '\0';
-  }
-  strncat(ctx->path, &(buff[first_byte]), *read_bytes - first_byte);
-  ctx->path[len] = '\0';
-  return should_continue;
-}
-
-// I will implement this later
-static int get_version(const char *buff, size_t buff_size,
-                       struct surv_http_context *ctx, int *read_bytes) {
-  int first_byte = *read_bytes;
-  int should_continue = 1;
-  int reached_r = 0;
-  while (*read_bytes < buff_size - 1) {
-    if (buff[*read_bytes] == '\r') {
-      reached_r = 1;
-    }
-    if (buff[*read_bytes] == '\n' && reached_r) {
-      should_continue = 0;
-      break;
-    }
-    ++(*read_bytes);
-  }
-  return should_continue;
-}
-
-static int get_headers(const char *buff, size_t buff_size,
-                      struct surv_http_context *ctx, int *read_bytes) {
-  return 0;
-}
-
-static int get_body(const char *buff, size_t buff_size,
-                    struct surv_http_context *ctx, int *read_bytes) {
-  return 0;
-}
-
-static int parse_request(struct surv_http_context *ctx,
-                         struct parse_state *state) {
-  int res = 0;
-  int read = 0;
-  switch (state->state) {
-  case METHOD:
-    res = get_method(state->buff, state->buff_size, ctx, &read);
-    if (res < 0) {
-      log_error("get_method() failed");
-      return -1;
-    }
-    state->state = PATH;
-  case PATH:
-    if (state->buff_size <= read)
-      return 0;
-    res = get_path(state->buff, state->buff_size, ctx, &read);
-    if (res < 0) {
-      log_error("get_path() failed");
-      return -1;
-    }
-    if (!res) state->state = VERSION;
-  case VERSION:
-    if (state->buff_size <= read)
-      return 0;
-    res = get_version(state->buff, state->buff_size, ctx, &read);
-    if (res < 0) {
-      log_error("get_version() failed");
-      return -1;
-    }
-    if (!res) state->state = HEADER;
-  case HEADER:
-    if (state->buff_size <= read)
-      return 0;
-    res = get_headers(state->buff, state->buff_size, ctx, &read);
-    if (res < 0) {
-      log_error("get_headers() failed");
-      return -1;
-    }
-    if (!res) state->state = BODY;
-  case BODY:
-    if (state->buff_size <= read)
-      return 0;
-    res = get_body(state->buff, state->buff_size, ctx, &read);
-    if (res < 0) {
-      log_error("get_body() failed");
-      return -1;
-    }
-    if (!res) state->state = DONE;
-  case DONE:
-    break;
-  }
-  return 0;
-}
 
 static void log_client_connection(const struct sockaddr_in *addr) {
   char addr_str[22];
@@ -210,11 +48,9 @@ static void *accept_worker(void *client) {
   struct parse_state state = {0};
   state.state = METHOD;
   state.buff = malloc(REQUEST_BUFFER_SIZE);
-  state.buff_size = REQUEST_BUFFER_SIZE;
   if (state.buff == NULL) {
     log_error("malloc() failed: %s", strerror(errno));
-    free(ctx);
-    goto cleanup;
+    goto free_ctx;
   }
 
   for (;;) {
@@ -225,18 +61,24 @@ static void *accept_worker(void *client) {
       goto free_ctx;
     }
     if (bytes_read == 0) {
-      log_info("No more data to read.");
       break;
     }
 
+    state.buff_size = bytes_read;
+    log_trace("Received %ld bytes", bytes_read);
+    log_trace("Request:\n%s", state.buff);
     int res;
     if ((res = parse_request(ctx, &state)) < 0) {
       goto free_ctx;
+    } else if (res == 1) {
+      break; // Done parsing, no more data in this request
+    } else if (res == 0 && state.state == BODY) {
+      // Haven't implemented body parsing yet
+      break;
     }
-    break;
   }
 
-  log_info("Client requesting resource:\n%s", ctx->path);
+  log_debug("Client requesting resource:%s", ctx->path);
 
   char helloworld[] = "HTTP/1.1 200 OK\r\n"
                       "Content-Type: text/plain\r\n"
@@ -253,14 +95,14 @@ free_ctx:
   case BODY:
     free(ctx->body);
   case HEADER:
-    free(ctx->headers);
+    hashmap_free(ctx->headers);
   case VERSION:
   case PATH:
     free(ctx->path);
+    hashmap_free(ctx->query_params);
   default:
     free(ctx);
   }
-  log_debug("Freed context for %d", c->client_sockfd);
 cleanup:
   close(c->client_sockfd);
   free(c);
@@ -285,7 +127,7 @@ int surv_setup(struct surv_server *server) {
     log_fatal("socket() failed: %s", strerror(errno));
     return SURV_ERR_SOCKET;
   }
-  log_trace("socket() succeeded. sockfd=%d", sockfd);
+  log_debug("socket() succeeded. sockfd=%d", sockfd);
 
   struct sockaddr_in server_addr = {0};
   server_addr.sin_family = AF_INET;
@@ -304,14 +146,14 @@ int surv_setup(struct surv_server *server) {
     close(sockfd);
     return SURV_ERR_BIND;
   }
-  log_trace("bind() succeeded");
+  log_debug("bind() succeeded");
 
   if (listen(sockfd, server->backlog) < 0) {
     log_error("listen() failed: %s", strerror(errno));
     close(sockfd);
     return SURV_ERR_LISTEN;
   }
-  log_trace("listen() succeeded");
+  log_debug("listen() succeeded");
   return sockfd;
 }
 
@@ -344,7 +186,7 @@ int surv_close() {
     log_warn("sockfd is already closed");
     return EBADF; // Bad file descriptor
   }
-  log_info("Closing sockfd=%d", sockfd);
+  log_debug("Closing sockfd=%d", sockfd);
   int i = 0;
   int res;
   while ((res = close(sockfd)) == EINTR && i < 100) {
