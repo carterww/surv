@@ -17,14 +17,16 @@ struct parse_state {
   enum { METHOD, PATH, VERSION, HEADER, BODY, DONE } state;
   char *buff;
   size_t buff_size;
+  char *carry;
 
-  char *incomplete_header;
+  char next_delim;
+
+  char **saveptr;
 };
 
-int parse_request(struct surv_http_context *ctx, struct parse_state *state,
-                  char **saveptr);
+int parse_request(struct surv_http_context *ctx, struct parse_state *state);
 
-char *strtok_r_nullable(char *str, const char *delim, char **saveptr);
+char *strtok_r_nullable(char *str, const char delim, char **saveptr);
 
 #ifdef __cplusplus
 }

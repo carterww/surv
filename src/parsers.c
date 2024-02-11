@@ -6,27 +6,20 @@
 
 // TODO: Performance test this to strtok_r to make sure it's comparable at
 // least
-char *strtok_r_nullable(char *str, const char *delim, char **saveptr) {
+char *strtok_r_nullable(char *str, const char delim, char **saveptr) {
   if (str == NULL) {
     str = *saveptr;
   }
   if (str == NULL) {
     return NULL;
   }
-  int delim_len = strlen(delim);
-  if (delim_len == 0) {
-    return NULL; // What?
-  }
-  char *end = strstr(str, delim);
+  char *end = strchr(str, delim);
   if (end == NULL) {
     *saveptr = NULL;
     return str;
   }
-  *saveptr = end + delim_len;
-  while (end != *saveptr) {
-    *end = '\0';
-    end++;
-  }
+  *saveptr = end + 1;
+  *end = '\0';
   return str;
 }
 
@@ -65,30 +58,92 @@ static int method_str_to_enum(const char *method, size_t len) {
   return -1;
 }
 
-static int get_method(char *buff, struct surv_http_context *ctx,
-                      char **saveptr) {
-  char *method = strtok_r(buff, " ", saveptr);
-  int method_enum = method_str_to_enum(method, 8);
+/* Combine the carry from last recv with the current buffer.
+ * If there is no carry, return the buffer and set should_free to 0.
+ * If there is a carry, combine the carry and buffer and set should_free to 1.
+ * This action allocates memory, so the caller should free the result if
+ * should_free is 1.
+ * On error, NULL is returned and should_free is set to 0.
+ */
+static char *combine_carry(struct parse_state *state, int *should_free, char *read) {
+  if (!state->carry) {
+    *should_free = 0;
+    return read;
+  }
+  size_t carry_len = strlen(state->carry);
+  size_t read_len = strnlen(read, state->buff_size);
+  char *combined = malloc(carry_len + read_len + 1);
+  if (combined == NULL) {
+    log_error("malloc() failed: %s", strerror(errno));
+    *should_free = 0;
+    return NULL;
+  }
+  strcpy(combined, state->carry);
+  combined[carry_len] = '\0';
+  strncat(combined, read, state->buff_size);
+  combined[carry_len + read_len] = '\0';
+  free(state->carry);
+  state->carry = NULL;
+  *should_free = 1;
+  return combined;
+}
+
+/* Save the carry from the buffer before calling recv again.
+ * Returns 0 on success, -1 on error.
+ */
+static int realloc_carry(struct parse_state *state) {
+  size_t buff_len = strlen(state->buff);
+  size_t carry_len = 0;
+  if (state->carry)
+    carry_len = strlen(state->carry);
+  state->carry = realloc(state->carry, carry_len + buff_len + 1);
+  if (carry_len == 0)
+    memset(state->carry, 0, carry_len + buff_len + 1);
+  if (state->carry == NULL) {
+    log_error("realloc() of carry failed: %s", strerror(errno));
+    return -1;
+  }
+  strncat(state->carry, state->buff, state->buff_size);
+  state->carry[carry_len + buff_len] = '\0';
+  return 0;
+}
+
+static int get_method(struct parse_state *state,
+                      struct surv_http_context *ctx) {
+  char *method = strtok_r_nullable(state->buff, ' ', state->saveptr);
+  // Method is partial, save carry
+  if (*state->saveptr == NULL && strlen(method) != 0) {
+    return realloc_carry(state);
+  }
+  int should_free = 0;
+  char *combined = combine_carry(state, &should_free, method);
+  if (combined == NULL)
+    return -1;
+
+  size_t len = strlen(combined);
+  int method_enum = method_str_to_enum(combined, MIN(state->buff_size, len));
   if (method_enum < 0) {
-    log_error("Invalid method: %s", method);
+    log_error("Invalid method: %s", combined);
     return -1;
   }
   ctx->method = method_enum;
+  log_debug("Method is %s", combined);
+  if (should_free) {
+    free(combined);
+  }
   return 1;
 }
 
 static void get_query_from_path(struct surv_http_context *ctx) {
   // sizeof, initial size, seed0, seed1, hash, cmp, free, userdata
-  if (ctx->query_params == NULL) {
-    ctx->query_params = hashmap_new(sizeof(struct surv_kv), 0, 0, 0, surv_kv_hash,
-        surv_kv_cmp, surv_kv_free, NULL);
-  }
   char *saveptr = NULL;
   char *key = strtok_r(ctx->path, "?", &saveptr);
   if (key == NULL) {
     log_debug("No query params");
     return;
   }
+  ctx->query_params = hashmap_new(sizeof(struct surv_kv), 0, 0, 0, surv_kv_hash,
+                                  surv_kv_cmp, surv_kv_free, NULL);
   while ((key = strtok_r(NULL, "=", &saveptr)) != NULL) {
     if (key == NULL) {
       return;
@@ -111,11 +166,12 @@ static void get_query_from_path(struct surv_http_context *ctx) {
       log_error("malloc() failed: %s", strerror(errno));
       return;
     }
-    strncpy(kv.key, key, key_len);
-    strncpy(kv.value, value, val_len);
+    strcpy(kv.key, key);
+    strcpy(kv.value, value);
     kv.key[key_len] = '\0';
     kv.value[val_len] = '\0';
-    if (hashmap_set(ctx->query_params, &kv) == NULL && hashmap_oom(ctx->query_params)) {
+    if (hashmap_set(ctx->query_params, &kv) == NULL &&
+        hashmap_oom(ctx->query_params)) {
       log_error("hashmap_set() failed: %s", strerror(errno));
       return;
     }
@@ -131,27 +187,61 @@ static void get_query_from_path(struct surv_http_context *ctx) {
   }
 }
 
-static int get_path(struct surv_http_context *ctx, char **saveptr) {
-  char *first = *saveptr;
-  char *path = strtok_r(NULL, " ", saveptr);
-  if (path == NULL) {
-    log_error("strtok_r() failed to find path");
-    return -1;
+static int get_path(struct parse_state *state, struct surv_http_context *ctx) {
+  if (*state->saveptr == NULL) {
+    *state->saveptr = state->buff;
   }
-  size_t len = *saveptr - first;
-  ctx->path = calloc(len, sizeof(char));
+  char *path = strtok_r_nullable(NULL, ' ', state->saveptr);
+  if (*state->saveptr == NULL && strlen(path) != 0) {
+    return realloc_carry(state);
+  }
+  int should_free = 0;
+  char *combined = combine_carry(state, &should_free, path);
+  if (combined == NULL)
+    return -1;
+
+  size_t len = strlen(combined);
+  ctx->path = malloc(len + 1);
   if (ctx->path == NULL) {
-    log_error("calloc() failed: %s", strerror(errno));
+    log_error("malloc() failed: %s", strerror(errno));
     return -1;
   }
-  strncpy(ctx->path, path, len);
+  strcpy(ctx->path, combined);
+  if (should_free)
+    free(combined);
+
+  ctx->path[len] = '\0';
+  log_debug("Path is %s", ctx->path);
   get_query_from_path(ctx);
+  state->next_delim = '\r';
   return 1;
 }
 
 // I will implement this later
-static int get_version(struct surv_http_context *ctx, char **saveptr) {
-  strtok_r(NULL, "\n", saveptr);
+static int get_version(struct parse_state *state,
+                       struct surv_http_context *ctx) {
+  if (*state->saveptr == NULL) {
+    *state->saveptr = state->buff;
+  }
+  char *version = strtok_r_nullable(NULL, state->next_delim, state->saveptr);
+  // If no next char and returned string does not have delim
+  if (*state->saveptr == NULL && strlen(version) != 0) {
+    return realloc_carry(state);
+  } else if (*state->saveptr == NULL && strlen(version) == 0) {
+    if (state->next_delim == '\r') {
+      state->next_delim = '\n';
+      return 0;
+    }
+  }
+  int should_free = 0;
+  char *combined = combine_carry(state, &should_free, version);
+  if (combined == NULL)
+    return -1;
+
+  log_debug("Version is %s", combined);
+  if (should_free)
+    free(combined);
+  state->next_delim = '\r';
   return 1;
 }
 
@@ -165,8 +255,7 @@ static int get_headers(struct surv_http_context *ctx, char **saveptr) {
   }
 
   char *header = NULL;
-  while ((header = strtok_r_nullable(NULL, "\r\n", saveptr)) != NULL) {
-    // TODO: Fix detecting end of headers
+  while ((header = strtok_r_nullable(NULL, '\r', saveptr)) != NULL) {
     if (header[0] == '\0') {
       return 1;
     }
@@ -194,8 +283,8 @@ static int get_headers(struct surv_http_context *ctx, char **saveptr) {
       log_error("malloc() failed: %s", strerror(errno));
       return -1;
     }
-    strncpy(kv.key, key, key_len);
-    strncpy(kv.value, value, value_len);
+    strcpy(kv.key, key);
+    strcpy(kv.value, value);
     kv.key[key_len] = '\0';
     kv.value[value_len] = '\0';
     if (hashmap_set(ctx->headers, &kv) == NULL && hashmap_oom(ctx->headers)) {
@@ -232,35 +321,50 @@ static int get_body(size_t buff_size, struct surv_http_context *ctx,
   return 1;
 }
 
-int parse_request(struct surv_http_context *ctx, struct parse_state *state,
-                  char **saveptr) {
+static int should_continue_parsing(struct parse_state *state, int res) {
+  if (res < 0) {
+    log_error("parse_request() failed in state %d", state->state);
+    return -1;
+  }
+  if (res == 0)
+    return 0;
+
+  if ((res && *state->saveptr == NULL) ||
+      (res && *state->saveptr &&
+       state->buff + state->buff_size <= *state->saveptr)) {
+    ++state->state;
+    return 0;
+  } else if (res) {
+    ++state->state;
+    return 1;
+  }
+  return 0;
+}
+
+int parse_request(struct surv_http_context *ctx, struct parse_state *state) {
   int res = 0;
   switch (state->state) {
   case METHOD:
-    res = get_method(state->buff, ctx, saveptr);
-    if (res < 0) {
-      log_error("get_method() failed");
-      return -1;
+    res = get_method(state, ctx);
+    res = should_continue_parsing(state, res);
+    if (res != 1) {
+      return res;
     }
-    state->state = PATH;
   case PATH:
-    res = get_path(ctx, saveptr);
-    if (res < 0) {
-      log_error("get_path() failed");
-      return -1;
+    res = get_path(state, ctx);
+    res = should_continue_parsing(state, res);
+    if (res != 1) {
+      return res;
     }
-    if (res)
-      state->state = VERSION;
   case VERSION:
-    res = get_version(ctx, saveptr);
-    if (res < 0) {
-      log_error("get_version() failed");
-      return -1;
+    res = get_version(state, ctx);
+    res = should_continue_parsing(state, res);
+    if (res != 1) {
+      return res;
     }
-    if (res)
-      state->state = HEADER;
   case HEADER:
-    res = get_headers(ctx, saveptr);
+    return 1;
+    res = get_headers(ctx, state->saveptr);
     if (res < 0) {
       log_error("get_headers() failed");
       return -1;
@@ -268,7 +372,7 @@ int parse_request(struct surv_http_context *ctx, struct parse_state *state,
     if (res)
       state->state = BODY;
   case BODY:
-    res = get_body(state->buff_size, ctx, saveptr);
+    res = get_body(state->buff_size, ctx, state->saveptr);
     if (res < 0) {
       log_error("get_body() failed");
       return -1;

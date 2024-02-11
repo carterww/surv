@@ -11,7 +11,7 @@
 #include "log.h"
 #include "hashmap.h"
 
-#define REQUEST_BUFFER_SIZE 8192
+#define REQUEST_BUFFER_SIZE 1024
 
 struct callback_info {
   char *path;
@@ -53,6 +53,11 @@ static void *accept_worker(void *client) {
     goto free_ctx;
   }
 
+  // TODO: Look into using strings directly from the buffer
+  // instead of copying them to new memory.
+  // Would need to make a new buffer each recv call and realloc
+  // the buffer on the last call to recv. This would save time
+  // and memory.
   for (;;) {
     ssize_t bytes_read =
         recv(c->client_sockfd, state.buff, REQUEST_BUFFER_SIZE - 1, 0);
@@ -66,12 +71,13 @@ static void *accept_worker(void *client) {
       break;
     }
 
+    char *saveptr = NULL;
+    state.saveptr = &saveptr;
     state.buff_size = bytes_read;
     log_trace("Received %ld bytes", bytes_read);
-    log_trace("Request:\n%s", state.buff);
+    log_trace("Request: %s", state.buff);
     int res;
-    char *saveptr;
-    if ((res = parse_request(ctx, &state, &saveptr)) < 0) {
+    if ((res = parse_request(ctx, &state)) < 0) {
       goto free_ctx;
     } else if (res == 1) {
       break; // Done parsing, no more data in this request
@@ -85,17 +91,21 @@ static void *accept_worker(void *client) {
   log_debug("Path: %s", ctx->path);
   void *item;
   size_t iter = 0;
-  while (hashmap_iter(ctx->query_params, &iter, &item)) {
-    struct surv_kv *kv = (struct surv_kv *)item;
-    log_debug("Param: %s:%s", kv->key, kv->value);
+  if (ctx->query_params) {
+    while (hashmap_iter(ctx->query_params, &iter, &item)) {
+      struct surv_kv *kv = (struct surv_kv *)item;
+      log_debug("Param: %s:%s", kv->key, kv->value);
+    }
   }
   iter = 0;
   item = NULL;
-  while (hashmap_iter(ctx->headers, &iter, &item)) {
-    struct surv_kv *kv = (struct surv_kv *)item;
-    log_debug("Header: %s:%s", kv->key, kv->value);
+  if (ctx->headers) {
+    while (hashmap_iter(ctx->headers, &iter, &item)) {
+      struct surv_kv *kv = (struct surv_kv *)item;
+      log_debug("Header: %s:%s", kv->key, kv->value);
+    }
   }
-  log_debug("Content: %s", ctx->body);
+  if (ctx->body) log_debug("Content: %s", ctx->body);
 
   char helloworld[] = "HTTP/1.1 200 OK\r\n"
                       "Content-Type: text/plain\r\n"
