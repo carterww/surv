@@ -85,11 +85,17 @@ static void *accept_worker(void *client) {
   log_debug("Path: %s", ctx->path);
   void *item;
   size_t iter = 0;
+  while (hashmap_iter(ctx->query_params, &iter, &item)) {
+    struct surv_kv *kv = (struct surv_kv *)item;
+    log_debug("Param: %s:%s", kv->key, kv->value);
+  }
+  iter = 0;
+  item = NULL;
   while (hashmap_iter(ctx->headers, &iter, &item)) {
     struct surv_kv *kv = (struct surv_kv *)item;
     log_debug("Header: %s:%s", kv->key, kv->value);
   }
-  log_debug("Client requesting resource:%s", ctx->path);
+  log_debug("Content: %s", ctx->body);
 
   char helloworld[] = "HTTP/1.1 200 OK\r\n"
                       "Content-Type: text/plain\r\n"

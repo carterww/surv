@@ -24,6 +24,8 @@ struct parse_state {
 int parse_request(struct surv_http_context *ctx, struct parse_state *state,
                   char **saveptr);
 
+char *strtok_r_nullable(char *str, const char *delim, char **saveptr);
+
 #ifdef __cplusplus
 }
 #endif
