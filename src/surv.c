@@ -7,11 +7,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "parsers.h"
-#include "log.h"
+#include "def.h"
 #include "hashmap.h"
+#include "log.h"
+#include "parsers.h"
 
-#define REQUEST_BUFFER_SIZE 1024
+#define REQUEST_BUFFER_SIZE 16
 
 struct callback_info {
   char *path;
@@ -52,6 +53,7 @@ static void *accept_worker(void *client) {
     log_error("malloc() failed: %s", strerror(errno));
     goto free_ctx;
   }
+  state.next_delim = ' ';
 
   // TODO: Look into using strings directly from the buffer
   // instead of copying them to new memory.
@@ -71,8 +73,6 @@ static void *accept_worker(void *client) {
       break;
     }
 
-    char *saveptr = NULL;
-    state.saveptr = &saveptr;
     state.buff_size = bytes_read;
     log_trace("Received %ld bytes", bytes_read);
     log_trace("Request: %s", state.buff);
@@ -93,19 +93,22 @@ static void *accept_worker(void *client) {
   size_t iter = 0;
   if (ctx->query_params) {
     while (hashmap_iter(ctx->query_params, &iter, &item)) {
-      struct surv_kv *kv = (struct surv_kv *)item;
-      log_debug("Param: %s:%s", kv->key, kv->value);
+      const struct surv_map_entry_str *kv =
+          (const struct surv_map_entry_str *)item;
+      log_debug("Query Param: %s: %s", kv->key, kv->value);
     }
   }
   iter = 0;
   item = NULL;
   if (ctx->headers) {
     while (hashmap_iter(ctx->headers, &iter, &item)) {
-      struct surv_kv *kv = (struct surv_kv *)item;
-      log_debug("Header: %s:%s", kv->key, kv->value);
+      const struct surv_map_entry_str *kv =
+          (const struct surv_map_entry_str *)item;
+      log_debug("Header: %s: %s", kv->key, kv->value);
     }
   }
-  if (ctx->body) log_debug("Content: %s", ctx->body);
+  if (ctx->body)
+    log_debug("Content: %s", ctx->body);
 
   char helloworld[] = "HTTP/1.1 200 OK\r\n"
                       "Content-Type: text/plain\r\n"
@@ -113,7 +116,6 @@ static void *accept_worker(void *client) {
                       "\r\n"
                       "Hello, World!";
   send(c->client_sockfd, helloworld, sizeof(helloworld), 0);
-
 
 free_ctx:
   free(state.buff);
@@ -125,8 +127,8 @@ free_ctx:
     hashmap_free(ctx->headers);
   case VERSION:
   case PATH:
-    free(ctx->path);
     hashmap_free(ctx->query_params);
+    free(ctx->path);
   default:
     free(ctx);
   }

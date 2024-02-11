@@ -21,7 +21,7 @@ struct parse_state {
 
   char next_delim;
 
-  char **saveptr;
+  char *saveptr;
 };
 
 int parse_request(struct surv_http_context *ctx, struct parse_state *state);
