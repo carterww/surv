@@ -21,7 +21,8 @@ struct parse_state {
   char *incomplete_header;
 };
 
-int parse_request(struct surv_http_context *ctx, struct parse_state *state);
+int parse_request(struct surv_http_context *ctx, struct parse_state *state,
+                  char **saveptr);
 
 #ifdef __cplusplus
 }

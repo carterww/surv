@@ -55,7 +55,9 @@ static void *accept_worker(void *client) {
 
   for (;;) {
     ssize_t bytes_read =
-        recv(c->client_sockfd, state.buff, REQUEST_BUFFER_SIZE, 0);
+        recv(c->client_sockfd, state.buff, REQUEST_BUFFER_SIZE - 1, 0);
+    // Make sure the buffer is null-terminated
+    state.buff[bytes_read] = '\0';
     if (bytes_read < 0) {
       log_error("recv() failed: %s", strerror(errno));
       goto free_ctx;
@@ -68,7 +70,8 @@ static void *accept_worker(void *client) {
     log_trace("Received %ld bytes", bytes_read);
     log_trace("Request:\n%s", state.buff);
     int res;
-    if ((res = parse_request(ctx, &state)) < 0) {
+    char *saveptr;
+    if ((res = parse_request(ctx, &state, &saveptr)) < 0) {
       goto free_ctx;
     } else if (res == 1) {
       break; // Done parsing, no more data in this request
@@ -78,6 +81,14 @@ static void *accept_worker(void *client) {
     }
   }
 
+  log_debug("Method: %d", ctx->method);
+  log_debug("Path: %s", ctx->path);
+  void *item;
+  size_t iter = 0;
+  while (hashmap_iter(ctx->headers, &iter, &item)) {
+    struct surv_kv *kv = (struct surv_kv *)item;
+    log_debug("Header: %s:%s", kv->key, kv->value);
+  }
   log_debug("Client requesting resource:%s", ctx->path);
 
   char helloworld[] = "HTTP/1.1 200 OK\r\n"
