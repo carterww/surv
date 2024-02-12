@@ -7,9 +7,25 @@
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
+// Definitions for parsing return flags
+#define PARSE_ERROR -1
+#define PARSE_READ_MORE 0
+#define PARSE_DONE 1
+
+static int more_in_buffer(struct parse_state *state) {
+  if (state->saveptr == NULL) {
+    return 0;
+  }
+  if (state->buff + state->buff_size <= state->saveptr) {
+    return 0;
+  }
+  return 1;
+}
+
 // TODO: Performance test this to strtok_r to make sure it's comparable at
 // least
-char *strtok_r_nullable(char *str, const char delim, char **saveptr) {
+char *strtok_r_nullable(char *str, const char delim, char **saveptr,
+                        int *reached_delim) {
   if (str == NULL) {
     str = *saveptr;
   }
@@ -22,6 +38,9 @@ char *strtok_r_nullable(char *str, const char delim, char **saveptr) {
   } else {
     *saveptr = end + 1;
     *end = '\0';
+  }
+  if (reached_delim) {
+    *reached_delim = end != NULL;
   }
   return str;
 }
@@ -55,8 +74,11 @@ static char *combine_carry(struct parse_state *state, int *should_free,
     *should_free = 0;
     return read;
   }
+  size_t read_len = 0;
+  if (read) {
+    read_len = strnlen(read, state->buff_size);
+  }
   size_t carry_len = strlen(state->carry);
-  size_t read_len = strnlen(read, state->buff_size);
   char *combined = malloc(carry_len + read_len + 1);
   if (combined == NULL) {
     log_error("malloc() failed: %s", strerror(errno));
@@ -65,7 +87,8 @@ static char *combine_carry(struct parse_state *state, int *should_free,
   }
   strcpy(combined, state->carry);
   combined[carry_len] = '\0';
-  strncat(combined, read, state->buff_size);
+  if (read)
+    strncat(combined, read, state->buff_size);
   combined[carry_len + read_len] = '\0';
   free(state->carry);
   state->carry = NULL;
@@ -76,48 +99,49 @@ static char *combine_carry(struct parse_state *state, int *should_free,
 /* Save the carry from the buffer before calling recv again.
  * Returns 0 on success, -1 on error.
  */
-static int realloc_carry(struct parse_state *state) {
-  size_t buff_len = strlen(state->buff);
+static int realloc_carry(struct parse_state *state, char *read) {
+  if (!read)
+    return PARSE_READ_MORE;
+  size_t read_len = strlen(read);
   size_t carry_len = 0;
   if (state->carry)
     carry_len = strlen(state->carry);
-  state->carry = realloc(state->carry, carry_len + buff_len + 1);
+  state->carry = realloc(state->carry, carry_len + read_len + 1);
   if (carry_len == 0)
-    memset(state->carry, 0, carry_len + buff_len + 1);
+    memset(state->carry, 0, carry_len + read_len + 1);
   if (state->carry == NULL) {
     log_error("realloc() of carry failed: %s", strerror(errno));
-    return -1;
+    return PARSE_ERROR;
   }
-  strncat(state->carry, state->buff, state->buff_size);
-  state->carry[carry_len + buff_len] = '\0';
-  return 0;
+  strncat(state->carry, read, read_len);
+  state->carry[carry_len + read_len] = '\0';
+  return PARSE_READ_MORE;
 }
 
 static int get_method(struct parse_state *state,
                       struct surv_http_context *ctx) {
-  char *method =
-      strtok_r_nullable(state->buff, state->next_delim, &state->saveptr);
-  // Method is partial, save carry
-  if (state->saveptr == NULL && strlen(method) != 0) {
-    return realloc_carry(state);
+  int reached_delim;
+  char *method = strtok_r_nullable(state->buff, state->next_delim,
+                                   &state->saveptr, &reached_delim);
+  if (!reached_delim) {
+    return realloc_carry(state, method);
   }
   int should_free = 0;
   char *combined = combine_carry(state, &should_free, method);
   if (combined == NULL)
-    return -1;
+    return PARSE_ERROR;
 
   size_t len = strlen(combined);
   int method_enum = method_str_to_enum(combined, MIN(state->buff_size, len));
   if (method_enum < 0) {
     log_error("Invalid method: %s", combined);
-    return -1;
+    return PARSE_ERROR;
   }
   ctx->method = method_enum;
   log_debug("Method is %s", combined);
-  if (should_free) {
+  if (should_free)
     free(combined);
-  }
-  return 1;
+  return PARSE_DONE;
 }
 
 static void get_query_from_path(struct surv_http_context *ctx) {
@@ -158,20 +182,22 @@ static int get_path(struct parse_state *state, struct surv_http_context *ctx) {
   if (state->saveptr == NULL) {
     state->saveptr = state->buff;
   }
-  char *path = strtok_r_nullable(NULL, state->next_delim, &state->saveptr);
-  if (state->saveptr == NULL && strlen(path) != 0) {
-    return realloc_carry(state);
+  int reached_delim;
+  char *path = strtok_r_nullable(NULL, state->next_delim, &state->saveptr,
+                                 &reached_delim);
+  if (!reached_delim) {
+    return realloc_carry(state, path);
   }
   int should_free = 0;
   char *combined = combine_carry(state, &should_free, path);
   if (combined == NULL)
-    return -1;
+    return PARSE_ERROR;
 
   size_t len = strlen(combined);
   ctx->path = malloc(len + 1);
   if (ctx->path == NULL) {
     log_error("malloc() failed: %s", strerror(errno));
-    return -1;
+    return PARSE_ERROR;
   }
   strcpy(ctx->path, combined);
   if (should_free)
@@ -180,34 +206,47 @@ static int get_path(struct parse_state *state, struct surv_http_context *ctx) {
   ctx->path[len] = '\0';
   log_debug("Path is %s", ctx->path);
   get_query_from_path(ctx);
-  return 1;
+  return PARSE_DONE;
+}
+
+static int parse_rton(struct parse_state *state, char **result,
+                      int *should_free) {
+  if (state->saveptr == NULL) {
+    state->saveptr = state->buff;
+  }
+  char *str = NULL;
+  if (state->next_delim == '\r') {
+    int reached_delim;
+    str = strtok_r_nullable(NULL, state->next_delim, &state->saveptr,
+        &reached_delim);
+    if (reached_delim && !more_in_buffer(state)) {
+      state->next_delim = '\n';
+      return realloc_carry(state, str);
+    } else if (reached_delim && more_in_buffer(state)) {
+      state->next_delim = '\n';
+    } else {
+      return realloc_carry(state, str);
+    }
+  }
+
+  int reached_delim;
+  char *rton = strtok_r_nullable(NULL, state->next_delim, &state->saveptr,
+      &reached_delim);
+  if (!reached_delim || !rton || rton[0] != '\0') {
+    return PARSE_ERROR;
+  }
+  *result = combine_carry(state, should_free, str);
+  return PARSE_DONE;
 }
 
 static int get_version(struct parse_state *state,
                        struct surv_http_context *ctx) {
-  if (state->saveptr == NULL) {
-    state->saveptr = state->buff;
-  }
-  char *version = strtok_r_nullable(NULL, state->next_delim, &state->saveptr);
-  size_t len = strlen(version);
-  // If no next char and returned string does not have delim
-  if (state->saveptr == NULL && len != 0) {
-    return realloc_carry(state);
-  } else if (state->saveptr == NULL && len == 0) {
-    if (state->next_delim == '\r') {
-      state->next_delim = '\n';
-      return 0;
-    }
-  }
   int should_free = 0;
-  char *combined = combine_carry(state, &should_free, version);
-  if (combined == NULL)
-    return -1;
-
-  log_debug("Version is %s", combined);
+  char *version = NULL;
+  int res = parse_rton(state, &version, &should_free);
   if (should_free)
-    free(combined);
-  return 1;
+    free(version);
+  return res;
 }
 
 static int get_headers(struct parse_state *state,
@@ -221,59 +260,49 @@ static int get_headers(struct parse_state *state,
                                surv_map_entry_str_free, NULL);
   }
 
-  if (state->saveptr == NULL) {
-    state->saveptr = state->buff;
-  }
-  char *header = strtok_r_nullable(NULL, state->next_delim, &state->saveptr);
-  if (state->saveptr == NULL && strlen(header) != 0) {
-    return realloc_carry(state);
-  } else if (state->saveptr == NULL && strlen(header) == 0) {
-    if (state->next_delim == '\r') {
-      state->next_delim = '\n';
-      return 0;
+  int should_free = 0;
+  char *header = NULL;
+  int res;
+  while ((res = parse_rton(state, &header, &should_free)) == PARSE_DONE) {
+    if (strlen(header) == 0) {
+      return PARSE_DONE;
     }
-  }
-  char *after_r;
-  while ((after_r = strtok_r_nullable(NULL, state->next_delim,
-                                      &state->saveptr)) != NULL) {
-    if (strlen(after_r) != 0) {
-      break;
-    }
-
-    char *loop_saveptr = NULL;
-    char *key = strtok_r(header, ":", &loop_saveptr);
-    char *value = strtok_r(NULL, "\0", &loop_saveptr);
-    if (!key || !value) {
-      log_error("strtok_r() failed to parse header %s", header);
-      return -1;
-    }
-    while (*value == ' ' && *value != '\0') {
-      value++;
-    }
+    char *saveptr = NULL;
+    // End of headers
     struct surv_map_entry_str kv = {0};
-    int key_len = strlen(key);
-    // TODO: fix these strlens, just calculate them from pointers
-    kv.key = malloc(sizeof(char) * key_len + 1);
-    if (kv.key == NULL) {
-      log_error("malloc() failed: %s", strerror(errno));
-      return -1;
+    char *key = strtok_r(header, ":", &saveptr);
+    if (key == NULL) {
+      log_error("Invalid key: %s", key);
+      return PARSE_ERROR;
     }
-    int value_len = strlen(value);
-    kv.value = malloc(sizeof(char) * value_len + 1);
-    if (kv.value == NULL) {
+    char *value = strtok_r(NULL, " ", &saveptr);
+    if (*value == '\0') {
+      log_error("Invalid header value: %s", value);
+      return PARSE_ERROR;
+    }
+    kv.key = malloc(strlen(key) + 1);
+    kv.value = malloc(strlen(value) + 1);
+    char *v = (char *)kv.value;
+    if (kv.key == NULL || kv.value == NULL) {
       log_error("malloc() failed: %s", strerror(errno));
-      return -1;
+      return PARSE_ERROR;
     }
     strcpy(kv.key, key);
-    strcpy(kv.value, value);
-    kv.key[key_len] = '\0';
-    // kv.value[value_len] = '\0';
-    if (hashmap_set(ctx->headers, &kv) == NULL && hashmap_oom(ctx->headers)) {
+    strcpy(v, value);
+    kv.key[strlen(key)] = '\0';
+    v[strlen(value)] = '\0';
+    if (hashmap_set(ctx->headers, &kv) == NULL &&
+        hashmap_oom(ctx->headers)) {
+      if (should_free)
+        free(header);
       log_error("hashmap_set() failed: %s", strerror(errno));
-      return -1;
+      return PARSE_ERROR;
     }
+    if (should_free)
+      free(header);
+    state->next_delim = '\r';
   }
-  return 1;
+  return res;
 }
 
 static int get_body(size_t buff_size, struct surv_http_context *ctx,
@@ -336,25 +365,25 @@ int parse_request(struct surv_http_context *ctx, struct parse_state *state) {
     }
   case PATH:
     res = get_path(state, ctx);
-    res = should_continue_parsing(state, res, '\n');
+    res = should_continue_parsing(state, res, '\r');
     if (res != 1) {
       return res;
     }
   case VERSION:
     res = get_version(state, ctx);
-    res = should_continue_parsing(state, res, '\n');
+    res = should_continue_parsing(state, res, '\r');
     if (res != 1) {
       return res;
     }
   case HEADER:
     res = get_headers(state, ctx);
-    res = should_continue_parsing(state, res, '\n');
+    res = should_continue_parsing(state, res, '\r');
     if (res != 1) {
       return res;
     }
   case BODY:
     res = get_body(state->buff_size, ctx, &state->saveptr);
-    res = should_continue_parsing(state, res, '\n');
+    res = should_continue_parsing(state, res, '\r');
     if (res != 1) {
       return res;
     }

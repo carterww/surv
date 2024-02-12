@@ -74,8 +74,8 @@ static void *accept_worker(void *client) {
     }
 
     state.buff_size = bytes_read;
+    state.saveptr = NULL;
     log_trace("Received %ld bytes", bytes_read);
-    log_trace("Request: %s", state.buff);
     int res;
     if ((res = parse_request(ctx, &state)) < 0) {
       goto free_ctx;
@@ -125,6 +125,7 @@ free_ctx:
     free(ctx->body);
   case HEADER:
     hashmap_free(ctx->headers);
+    log_debug("Freed headers");
   case VERSION:
   case PATH:
     hashmap_free(ctx->query_params);
