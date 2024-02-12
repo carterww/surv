@@ -1,25 +1,48 @@
-#include "parsers.h"
+#include <stdbool.h>
+#include <stdlib.h>
+
+#include "def.h"
 #include "hashmap.h"
+#include "parsers.h"
 
 #define MIN(a, b) (((a) < (b)) ? (a) : (b))
 
-static int surv_kv_cmp(const void *a, const void *b, void *ud) {
-  struct surv_kv *kv_a = (struct surv_kv *)a;
-  struct surv_kv *kv_b = (struct surv_kv *)b;
-  return strcmp(kv_a->key, kv_b->key);
+// Definitions for parsing return flags
+#define PARSE_ERROR -1
+#define PARSE_READ_MORE 0
+#define PARSE_DONE 1
+
+static int more_in_buffer(struct parse_state *state) {
+  if (state->saveptr == NULL) {
+    return 0;
+  }
+  if (state->buff + state->buff_size <= state->saveptr) {
+    return 0;
+  }
+  return 1;
 }
 
-static uint64_t surv_kv_hash(const void *item, uint64_t seed0, uint64_t seed1) {
-  struct surv_kv *kv = (struct surv_kv *)item;
-  return hashmap_sip(kv->key, strlen(kv->key), seed0, seed1);
-}
-
-static void surv_kv_free(void *item) {
-  if (item == NULL)
-    return;
-  struct surv_kv *kv = (struct surv_kv *)item;
-  free(kv->key);
-  free(kv->value);
+// TODO: Performance test this to strtok_r to make sure it's comparable at
+// least
+char *strtok_r_nullable(char *str, const char delim, char **saveptr,
+                        int *reached_delim) {
+  if (str == NULL) {
+    str = *saveptr;
+  }
+  if (str == NULL) {
+    return NULL;
+  }
+  char *end = strchr(str, delim);
+  if (end == NULL) {
+    *saveptr = NULL;
+  } else {
+    *saveptr = end + 1;
+    *end = '\0';
+  }
+  if (reached_delim) {
+    *reached_delim = end != NULL;
+  }
+  return str;
 }
 
 static int method_str_to_enum(const char *method, size_t len) {
@@ -38,311 +61,332 @@ static int method_str_to_enum(const char *method, size_t len) {
   return -1;
 }
 
-static int get_method(const char *buff, size_t buff_size,
-                      struct surv_http_context *ctx, int *read_bytes) {
-  // 8 is lowest len of method
-  int upper_bound = MIN(buff_size, 8);
-  while (*read_bytes < upper_bound) {
-    if (buff[*read_bytes] != ' ') {
-      ++(*read_bytes);
-      continue;
-    }
-    int method = method_str_to_enum(buff, *read_bytes);
-    if (method < 0) {
-      log_error("Invalid method: %s", *read_bytes, buff);
-      return -1;
-    }
-    ctx->method = method;
-    ++(*read_bytes);
-    return 1;
+/* Combine the carry from last recv with the current buffer.
+ * If there is no carry, return the buffer and set should_free to 0.
+ * If there is a carry, combine the carry and buffer and set should_free to 1.
+ * This action allocates memory, so the caller should free the result if
+ * should_free is 1.
+ * On error, NULL is returned and should_free is set to 0.
+ */
+static char *combine_carry(struct parse_state *state, int *should_free,
+                           char *read) {
+  if (!state->carry) {
+    *should_free = 0;
+    return read;
   }
-  return -1;
+  size_t read_len = 0;
+  if (read) {
+    read_len = strnlen(read, state->buff_size);
+  }
+  size_t carry_len = strlen(state->carry);
+  char *combined = malloc(carry_len + read_len + 1);
+  if (combined == NULL) {
+    log_error("malloc() failed: %s", strerror(errno));
+    *should_free = 0;
+    return NULL;
+  }
+  strcpy(combined, state->carry);
+  combined[carry_len] = '\0';
+  if (read)
+    strncat(combined, read, state->buff_size);
+  combined[carry_len + read_len] = '\0';
+  free(state->carry);
+  state->carry = NULL;
+  *should_free = 1;
+  return combined;
 }
 
-static int get_query_from_path(const char *buff, size_t buff_size,
-                               struct surv_http_context *ctx, int *read_bytes) {
+/* Save the carry from the buffer before calling recv again.
+ * Returns 0 on success, -1 on error.
+ */
+static int realloc_carry(struct parse_state *state, char *read) {
+  if (!read)
+    return PARSE_READ_MORE;
+  size_t read_len = strlen(read);
+  size_t carry_len = 0;
+  if (state->carry)
+    carry_len = strlen(state->carry);
+  state->carry = realloc(state->carry, carry_len + read_len + 1);
+  if (carry_len == 0)
+    memset(state->carry, 0, carry_len + read_len + 1);
+  if (state->carry == NULL) {
+    log_error("realloc() of carry failed: %s", strerror(errno));
+    return PARSE_ERROR;
+  }
+  strncat(state->carry, read, read_len);
+  state->carry[carry_len + read_len] = '\0';
+  return PARSE_READ_MORE;
+}
+
+static int get_method(struct parse_state *state,
+                      struct surv_http_context *ctx) {
+  int reached_delim;
+  char *method = strtok_r_nullable(state->buff, state->next_delim,
+                                   &state->saveptr, &reached_delim);
+  if (!reached_delim) {
+    return realloc_carry(state, method);
+  }
+  int should_free = 0;
+  char *combined = combine_carry(state, &should_free, method);
+  if (combined == NULL)
+    return PARSE_ERROR;
+
+  size_t len = strlen(combined);
+  int method_enum = method_str_to_enum(combined, MIN(state->buff_size, len));
+  if (method_enum < 0) {
+    log_error("Invalid method: %s", combined);
+    return PARSE_ERROR;
+  }
+  ctx->method = method_enum;
+  log_debug("Method is %s", combined);
+  if (should_free)
+    free(combined);
+  return PARSE_DONE;
+}
+
+static void get_query_from_path(struct surv_http_context *ctx) {
   // sizeof, initial size, seed0, seed1, hash, cmp, free, userdata
-  ctx->query_params = hashmap_new(sizeof(struct surv_kv), 0, 0, 0, surv_kv_hash,
-                                  surv_kv_cmp, surv_kv_free, NULL);
-  return 1;
+  char *saveptr = NULL;
+  char *key = strtok_r(ctx->path, "?", &saveptr);
+  if (key == NULL) {
+    log_debug("No query params");
+    return;
+  }
+  ctx->query_params =
+      hashmap_new(sizeof(struct surv_map_entry_str), 0, 0, 0,
+                  surv_map_entry_str_hash, surv_map_entry_str_cmp, NULL, NULL);
+
+  while ((key = strtok_r(NULL, "=", &saveptr)) != NULL) {
+    if (key == NULL) {
+      return;
+    }
+    char *value = strtok_r(NULL, "&", &saveptr);
+    if (value == NULL) {
+      return;
+    }
+
+    struct surv_map_entry_str kv = {0};
+    // ctx->path has same lifetime as this hashmap,
+    // so we can just use the pointers directly
+    kv.key = key;
+    kv.value = value;
+    if (hashmap_set(ctx->query_params, &kv) == NULL &&
+        hashmap_oom(ctx->query_params)) {
+      log_error("hashmap_set() failed: %s", strerror(errno));
+      return;
+    }
+  }
 }
 
-static int get_path(const char *buff, size_t buff_size,
-                    struct surv_http_context *ctx, int *read_bytes) {
-  int first_byte = *read_bytes;
-  int is_done = 0;
-  while (*read_bytes < buff_size) {
-    if (buff[*read_bytes] == ' ') {
-      is_done = 1;
-      break;
-    }
-    ++(*read_bytes);
-    continue;
+static int get_path(struct parse_state *state, struct surv_http_context *ctx) {
+  if (state->saveptr == NULL) {
+    state->saveptr = state->buff;
   }
-  size_t len = *read_bytes - first_byte;
+  int reached_delim;
+  char *path = strtok_r_nullable(NULL, state->next_delim, &state->saveptr,
+                                 &reached_delim);
+  if (!reached_delim) {
+    return realloc_carry(state, path);
+  }
+  int should_free = 0;
+  char *combined = combine_carry(state, &should_free, path);
+  if (combined == NULL)
+    return PARSE_ERROR;
+
+  size_t len = strlen(combined);
+  ctx->path = malloc(len + 1);
   if (ctx->path == NULL) {
-    ctx->path = calloc(len + 1, sizeof(char));
-    if (ctx->path == NULL) {
-      log_error("calloc() failed: %s", strerror(errno));
-      return -1;
-    }
-  } else {
-    size_t old_len = strlen(ctx->path);
-    len += old_len;
-    ctx->path = realloc(ctx->path, len + 1);
-    if (ctx->path == NULL) {
-      log_error("realloc() failed: %s", strerror(errno));
-      return -1;
-    }
-    ctx->path[old_len + 1] = '\0';
+    log_error("malloc() failed: %s", strerror(errno));
+    return PARSE_ERROR;
   }
+  strcpy(ctx->path, combined);
+  if (should_free)
+    free(combined);
 
-  strncat(ctx->path, &(buff[first_byte]), *read_bytes - first_byte);
   ctx->path[len] = '\0';
-  ++(*read_bytes);
-  return is_done;
+  log_debug("Path is %s", ctx->path);
+  get_query_from_path(ctx);
+  return PARSE_DONE;
 }
 
-// I will implement this later
-static int get_version(const char *buff, size_t buff_size,
-                       struct surv_http_context *ctx, int *read_bytes) {
-  int first_byte = *read_bytes;
-  int is_done = 0;
-  int reached_r = 0;
-  while (*read_bytes < buff_size - 1 && !is_done) {
-    if (buff[*read_bytes] == '\r') {
-      reached_r = 1;
-      ++(*read_bytes);
-    }
-    if (buff[*read_bytes] == '\n' && reached_r) {
-      is_done = 1;
-    }
-    ++(*read_bytes);
+static int parse_rton(struct parse_state *state, char **result,
+                      int *should_free) {
+  if (state->saveptr == NULL) {
+    state->saveptr = state->buff;
   }
-  return is_done;
+  char *str = NULL;
+  if (state->next_delim == '\r') {
+    int reached_delim;
+    str = strtok_r_nullable(NULL, state->next_delim, &state->saveptr,
+        &reached_delim);
+    if (reached_delim && !more_in_buffer(state)) {
+      state->next_delim = '\n';
+      return realloc_carry(state, str);
+    } else if (reached_delim && more_in_buffer(state)) {
+      state->next_delim = '\n';
+    } else {
+      return realloc_carry(state, str);
+    }
+  }
+
+  int reached_delim;
+  char *rton = strtok_r_nullable(NULL, state->next_delim, &state->saveptr,
+      &reached_delim);
+  if (!reached_delim || !rton || rton[0] != '\0') {
+    return PARSE_ERROR;
+  }
+  *result = combine_carry(state, should_free, str);
+  return PARSE_DONE;
 }
 
-static int parse_indv_header(const char *buff, size_t buff_size,
-                             struct surv_kv *kv, int first_byte, int last_byte,
-                             struct hashmap *map) {
-
-  int len = last_byte - first_byte;
-  int colon = -1;
-  int start_value = -1;
-  for (int i = first_byte; i < last_byte; ++i) {
-    if (buff[i] == ':') {
-      colon = i;
-      continue;
-    }
-    if (colon != -1 && buff[i] != ' ' && start_value == -1) {
-      start_value = i;
-      break;
-    }
-  }
-  if (colon < 0) {
-    char *bytes = calloc(last_byte - first_byte + 1, sizeof(char));
-    strncpy(bytes, &(buff[first_byte]), last_byte - first_byte);
-    log_error("Invalid header: %s", bytes);
-    free(bytes);
-    return 0;
-  }
-  kv->key = calloc(colon - first_byte + 1, sizeof(char));
-  kv->value = calloc(last_byte - start_value + 1, sizeof(char));
-  strncpy(kv->key, &(buff[first_byte]), colon - first_byte);
-  strncpy(kv->value, &(buff[start_value]), last_byte - start_value);
-  kv->key[colon - first_byte] = '\0';
-  kv->value[last_byte - start_value] = '\0';
-
-  // set copies the data so don't need to alloc
-  if (hashmap_set(map, kv) == NULL && hashmap_oom(map)) {
-    log_error("hashmap_set() is oom?");
-    return -1;
-  }
-  return 0;
+static int get_version(struct parse_state *state,
+                       struct surv_http_context *ctx) {
+  int should_free = 0;
+  char *version = NULL;
+  int res = parse_rton(state, &version, &should_free);
+  if (should_free)
+    free(version);
+  return res;
 }
 
-static int parse_indv_with_incomplete(const char *buff, size_t buff_size,
-                                      struct surv_kv *kv, int first_byte,
-                                      int last_byte, struct hashmap *map,
-                                      char **incomplete_header) {
-  // This case is so much easier and way more common
-  // so I will handle it in a more efficient manner
-  if (*incomplete_header == NULL)
-    return parse_indv_header(buff, buff_size, kv, first_byte, last_byte, map);
+static int get_headers(struct parse_state *state,
+                       struct surv_http_context *ctx) {
 
-  // This case is rare and ugly, please don't even
-  // look unless there's a bug
-  int colon = -1;
-  int start_value = -1;
-  int start_value_in_buff = 1;
-
-  size_t len = strlen(*incomplete_header);
-  for (int i = 0; i < len; ++i) {
-    if ((*incomplete_header)[i] == ':') {
-      colon = i;
-      continue;
-    }
-    if (colon != -1 && (*incomplete_header)[i] != ' ') {
-      start_value = i;
-      start_value_in_buff = 0;
-      break;
-    }
-  }
-
-  size_t incomplete_len = strlen(*incomplete_header);
-  if (colon != -1) {
-    kv->key = calloc(colon + 1, sizeof(char));
-    strncpy(kv->key, *incomplete_header, colon);
-    kv->key[colon] = '\0';
-  } else {
-    for (int i = first_byte; i < last_byte; ++i) {
-      if (buff[i] == ':') {
-        colon = i;
-        continue;
-      }
-      if (colon != -1 && buff[i] != ' ' && start_value == -1) {
-        start_value = i;
-        start_value_in_buff = 1;
-        break;
-      }
-    }
-    if (colon < 0) {
-      return -1;
-    }
-    kv->key = calloc(incomplete_len + colon - first_byte + 1, sizeof(char));
-    strncpy(kv->key, *incomplete_header, incomplete_len);
-    strncat(kv->key, &(buff[first_byte]), colon - first_byte);
-    kv->key[incomplete_len + colon - first_byte] = '\0';
-  }
-  // KEY IS TAKEN CARE OF
-
-  if (start_value_in_buff) {
-    kv->value = calloc(last_byte - start_value + 1, sizeof(char));
-    strncpy(kv->value, &(buff[start_value]), last_byte - start_value);
-    kv->value[last_byte - start_value] = '\0';
-  } else {
-    kv->value =
-        calloc(incomplete_len - start_value + 1 + last_byte - first_byte,
-               sizeof(char));
-    strncpy(kv->value, &((*incomplete_header)[start_value]),
-            incomplete_len - start_value);
-    strncat(kv->value, &(buff[first_byte]), last_byte - first_byte);
-    kv->value[incomplete_len - start_value + last_byte - first_byte] = '\0';
-  }
-  hashmap_set(map, kv);
-
-  *incomplete_header = NULL;
-  return 0;
-}
-
-static int get_headers(const char *buff, size_t buff_size,
-                       struct surv_http_context *ctx, int *read_bytes,
-                       char **incomplete_header) {
-
+  // TODO: Move to worker function, this should not be done here
   if (ctx->headers == NULL) {
     // sizeof, initial size, seed0, seed1, hash, cmp, free, userdata
-    ctx->headers = hashmap_new(sizeof(struct surv_kv), 0, 0, 0, surv_kv_hash,
-                               surv_kv_cmp, surv_kv_free, NULL);
-  }
-  int first_byte = *read_bytes;
-  int is_done = 0;
-  int reached_r = 0;
-  while (*read_bytes < buff_size - 1 && !is_done) {
-    if (buff[*read_bytes] == '\r') {
-      ++(*read_bytes);
-      reached_r = 1;
-    }
-    if (buff[*read_bytes] == '\n' && reached_r) {
-      is_done = 1;
-    }
-    ++(*read_bytes);
-
-    if (is_done) {
-      if (*read_bytes - first_byte == 2) {
-        // Empty line, end of headers
-        break;
-      }
-      int last_byte = *read_bytes - 2;
-      struct surv_kv kv = {0};
-
-      if (parse_indv_with_incomplete(buff, buff_size, &kv, first_byte,
-                                     last_byte, ctx->headers,
-                                     incomplete_header) < 0) {
-        log_error("parse_indv_with_incomplete() failed");
-        return -1;
-      }
-
-      is_done = 0;
-      first_byte = *read_bytes;
-    }
-  }
-  if (is_done == 0) {
-    // Save what got halfway read
-    *incomplete_header = calloc(buff_size - first_byte + 1, sizeof(char));
-    strncpy(*incomplete_header, &(buff[first_byte]), buff_size - first_byte);
-    (*incomplete_header)[buff_size - first_byte] = '\0';
+    ctx->headers = hashmap_new(sizeof(struct surv_map_entry_str), 0, 0, 0,
+                               surv_map_entry_str_hash, surv_map_entry_str_cmp,
+                               surv_map_entry_str_free, NULL);
   }
 
-  return is_done;
+  int should_free = 0;
+  char *header = NULL;
+  int res;
+  while ((res = parse_rton(state, &header, &should_free)) == PARSE_DONE) {
+    if (strlen(header) == 0) {
+      return PARSE_DONE;
+    }
+    char *saveptr = NULL;
+    // End of headers
+    struct surv_map_entry_str kv = {0};
+    char *key = strtok_r(header, ":", &saveptr);
+    if (key == NULL) {
+      log_error("Invalid key: %s", key);
+      return PARSE_ERROR;
+    }
+    char *value = strtok_r(NULL, " ", &saveptr);
+    if (*value == '\0') {
+      log_error("Invalid header value: %s", value);
+      return PARSE_ERROR;
+    }
+    kv.key = malloc(strlen(key) + 1);
+    kv.value = malloc(strlen(value) + 1);
+    char *v = (char *)kv.value;
+    if (kv.key == NULL || kv.value == NULL) {
+      log_error("malloc() failed: %s", strerror(errno));
+      return PARSE_ERROR;
+    }
+    strcpy(kv.key, key);
+    strcpy(v, value);
+    kv.key[strlen(key)] = '\0';
+    v[strlen(value)] = '\0';
+    if (hashmap_set(ctx->headers, &kv) == NULL &&
+        hashmap_oom(ctx->headers)) {
+      if (should_free)
+        free(header);
+      log_error("hashmap_set() failed: %s", strerror(errno));
+      return PARSE_ERROR;
+    }
+    if (should_free)
+      free(header);
+    state->next_delim = '\r';
+  }
+  return res;
 }
 
-static int get_body(const char *buff, size_t buff_size,
-                    struct surv_http_context *ctx, int *read_bytes) {
+static int get_body(size_t buff_size, struct surv_http_context *ctx,
+                    char **saveptr) {
+  long long content_length = -1;
+  struct surv_map_entry_str kv = {0};
+  kv.key = "Content-Length";
+
+  const void *item;
+  if ((item = hashmap_get(ctx->headers, &kv)) != NULL) {
+    const struct surv_kv *kv_get = (const struct surv_kv *)item;
+    // content_length = atoll(kv_get->value);
+  }
+  if (content_length < 0) {
+    log_debug("No content");
+    return 1;
+  }
+
+  ctx->body = malloc(content_length + 1);
+  if (ctx->body == NULL) {
+    log_error("malloc() failed: %s", strerror(errno));
+    return -1;
+  }
+  strncpy(ctx->body, *saveptr, MIN(content_length, buff_size));
+  ctx->body[content_length] = '\0';
   return 1;
+}
+
+static int should_continue_parsing(struct parse_state *state, int res,
+                                   const char next_state_delim) {
+  if (res < 0) {
+    log_error("parse_request() failed in state %d", state->state);
+    return -1;
+  }
+  if (res == 0)
+    return 0;
+
+  if ((res && state->saveptr == NULL) ||
+      (res && state->saveptr &&
+       state->buff + state->buff_size <= state->saveptr)) {
+    ++state->state;
+    state->next_delim = next_state_delim;
+    return 0;
+  } else if (res) {
+    ++state->state;
+    state->next_delim = next_state_delim;
+    return 1;
+  }
+  return 0;
 }
 
 int parse_request(struct surv_http_context *ctx, struct parse_state *state) {
   int res = 0;
-  int read = 0;
   switch (state->state) {
   case METHOD:
-    res = get_method(state->buff, state->buff_size, ctx, &read);
-    if (res < 0) {
-      log_error("get_method() failed");
-      return -1;
+    res = get_method(state, ctx);
+    res = should_continue_parsing(state, res, ' ');
+    if (res != 1) {
+      return res;
     }
-    state->state = PATH;
   case PATH:
-    if (state->buff_size <= read)
-      return 0;
-    res = get_path(state->buff, state->buff_size, ctx, &read);
-    if (res < 0) {
-      log_error("get_path() failed");
-      return -1;
+    res = get_path(state, ctx);
+    res = should_continue_parsing(state, res, '\r');
+    if (res != 1) {
+      return res;
     }
-    if (res)
-      state->state = VERSION;
   case VERSION:
-    if (state->buff_size <= read)
-      return 0;
-    res = get_version(state->buff, state->buff_size, ctx, &read);
-    if (res < 0) {
-      log_error("get_version() failed");
-      return -1;
+    res = get_version(state, ctx);
+    res = should_continue_parsing(state, res, '\r');
+    if (res != 1) {
+      return res;
     }
-    if (res)
-      state->state = HEADER;
   case HEADER:
-    if (state->buff_size <= read)
-      return 0;
-    res = get_headers(state->buff, state->buff_size, ctx, &read,
-                      &state->incomplete_header);
-    if (res < 0) {
-      log_error("get_headers() failed");
-      return -1;
+    res = get_headers(state, ctx);
+    res = should_continue_parsing(state, res, '\r');
+    if (res != 1) {
+      return res;
     }
-    if (res)
-      state->state = BODY;
   case BODY:
-    if (state->buff_size <= read)
-      return 0;
-    res = get_body(state->buff, state->buff_size, ctx, &read);
-    if (res < 0) {
-      log_error("get_body() failed");
-      return -1;
+    res = get_body(state->buff_size, ctx, &state->saveptr);
+    res = should_continue_parsing(state, res, '\r');
+    if (res != 1) {
+      return res;
     }
-    if (res)
-      state->state = DONE;
   case DONE:
     return 1;
   }

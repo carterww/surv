@@ -7,11 +7,12 @@
 #include <sys/socket.h>
 #include <unistd.h>
 
-#include "parsers.h"
-#include "log.h"
+#include "def.h"
 #include "hashmap.h"
+#include "log.h"
+#include "parsers.h"
 
-#define REQUEST_BUFFER_SIZE 8192
+#define REQUEST_BUFFER_SIZE 16
 
 struct callback_info {
   char *path;
@@ -52,10 +53,18 @@ static void *accept_worker(void *client) {
     log_error("malloc() failed: %s", strerror(errno));
     goto free_ctx;
   }
+  state.next_delim = ' ';
 
+  // TODO: Look into using strings directly from the buffer
+  // instead of copying them to new memory.
+  // Would need to make a new buffer each recv call and realloc
+  // the buffer on the last call to recv. This would save time
+  // and memory.
   for (;;) {
     ssize_t bytes_read =
-        recv(c->client_sockfd, state.buff, REQUEST_BUFFER_SIZE, 0);
+        recv(c->client_sockfd, state.buff, REQUEST_BUFFER_SIZE - 1, 0);
+    // Make sure the buffer is null-terminated
+    state.buff[bytes_read] = '\0';
     if (bytes_read < 0) {
       log_error("recv() failed: %s", strerror(errno));
       goto free_ctx;
@@ -65,8 +74,8 @@ static void *accept_worker(void *client) {
     }
 
     state.buff_size = bytes_read;
+    state.saveptr = NULL;
     log_trace("Received %ld bytes", bytes_read);
-    log_trace("Request:\n%s", state.buff);
     int res;
     if ((res = parse_request(ctx, &state)) < 0) {
       goto free_ctx;
@@ -78,7 +87,28 @@ static void *accept_worker(void *client) {
     }
   }
 
-  log_debug("Client requesting resource:%s", ctx->path);
+  log_debug("Method: %d", ctx->method);
+  log_debug("Path: %s", ctx->path);
+  void *item;
+  size_t iter = 0;
+  if (ctx->query_params) {
+    while (hashmap_iter(ctx->query_params, &iter, &item)) {
+      const struct surv_map_entry_str *kv =
+          (const struct surv_map_entry_str *)item;
+      log_debug("Query Param: %s: %s", kv->key, kv->value);
+    }
+  }
+  iter = 0;
+  item = NULL;
+  if (ctx->headers) {
+    while (hashmap_iter(ctx->headers, &iter, &item)) {
+      const struct surv_map_entry_str *kv =
+          (const struct surv_map_entry_str *)item;
+      log_debug("Header: %s: %s", kv->key, kv->value);
+    }
+  }
+  if (ctx->body)
+    log_debug("Content: %s", ctx->body);
 
   char helloworld[] = "HTTP/1.1 200 OK\r\n"
                       "Content-Type: text/plain\r\n"
@@ -86,7 +116,6 @@ static void *accept_worker(void *client) {
                       "\r\n"
                       "Hello, World!";
   send(c->client_sockfd, helloworld, sizeof(helloworld), 0);
-
 
 free_ctx:
   free(state.buff);
@@ -96,10 +125,11 @@ free_ctx:
     free(ctx->body);
   case HEADER:
     hashmap_free(ctx->headers);
+    log_debug("Freed headers");
   case VERSION:
   case PATH:
-    free(ctx->path);
     hashmap_free(ctx->query_params);
+    free(ctx->path);
   default:
     free(ctx);
   }

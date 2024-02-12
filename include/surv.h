@@ -19,11 +19,6 @@ struct surv_sock_client {
   struct sockaddr addr;
 };
 
-struct surv_kv {
-  char *key;
-  char *value;
-};
-
 // Context for HTTP requests. This will be passed to the handler
 // functions.
 struct surv_http_context {
